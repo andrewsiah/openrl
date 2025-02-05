@@ -6,10 +6,13 @@ import argparse
 from datetime import datetime
 from typing import Dict, Any
 
+import tqdm
+import numpy as np
 import re
 import torch
+import torch.distributed as dist
 from datasets import load_dataset, Dataset
-from transformers import AutoTokenizer, AutoModelForCausalLM
+from transformers import AutoTokenizer, AutoModelForCausalLM, GenerationConfig
 from trl import GRPOConfig, GRPOTrainer
 
 
@@ -219,7 +222,8 @@ def correctness_reward_func(prompts, completions, answer, **kwargs) -> list[floa
             if incorrect_indices
             else 0,
         }
-        trainer.accelerator.log(metrics, step=current_step)
+        for key, value in metrics.items():
+            trainer._metrics[key].append(value)
 
     return [2.0 if r == a else 0.0 for r, a in zip(extracted_responses, answer)]
 
@@ -270,6 +274,106 @@ model_name = config["model"]["name"]
 output_dir = config["training"]["output_dir"]
 run_name = config["training"]["run_name"]
 
+class CustomGRPOTrainer(GRPOTrainer):
+    def evaluate(
+        self, eval_dataset=None, ignore_keys=None, metric_key_prefix: str = "eval"
+    ):
+        tokenized_samples = tokenize_validation(
+            self.processing_class, 
+            self.eval_dataset, 
+            self.args.max_prompt_length
+        )
+        eval_acc = generate_gsm8k(
+            self.model, 
+            self.processing_class, 
+            tokenized_samples, 
+            self.args.per_device_eval_batch_size, 
+            self.args.max_completion_length
+        )
+
+        output = {
+            f"{metric_key_prefix}_accuracy": eval_acc,
+            "epoch": self.state.epoch,
+        }
+
+        self.log(output)
+        self.control = self.callback_handler.on_evaluate(
+            self.args, self.state, self.control, output
+        )
+
+        return output
+
+def tokenize_validation(tokenizer, samples, max_prompt_length):
+    tokenized_samples = []
+    for sample in samples:
+        prompt = sample["prompt"]
+        answer = sample['answer']
+        ids = tokenizer.apply_chat_template(
+            prompt,
+            add_generation_prompt=True,
+            truncation=True,
+            max_length=max_prompt_length,
+        )
+        tokenized_samples.append((ids, answer))
+    return tokenized_samples
+
+def generate_gsm8k(
+    model,
+    tokenizer,
+    tokenized_samples,
+    batch_size,
+    max_completion_length
+):
+    # run eval on main process only
+    if not dist.is_initialized() or dist.get_rank() == 0:
+        device = model.device
+        predictions = []
+        generation_config = GenerationConfig(
+            max_new_tokens=max_completion_length,
+            do_sample=False,
+            repetition_penalty=1.0,
+            eos_token_id=tokenizer.eos_token_id,
+            pad_token_id=tokenizer.pad_token_id,
+        )
+        model.eval()
+        count = len(tokenized_samples)
+        
+        status = tqdm.tqdm(range(0, count, batch_size), desc=f"Correct: 0/{count}")
+        for i in status:
+            batches = tokenized_samples[i:i+batch_size]
+            with torch.inference_mode():
+                longest = max(len(b[0]) for b in batches)
+
+                # pad to longest on left side for decoder
+                padded_input_ids = torch.stack([
+                    torch.tensor([tokenizer.pad_token_id] * (longest - len(ids)) + ids)
+                    for ids, _ in batches
+                ]).to(device)
+                # ignore pad token when generating
+                attn_mask = torch.stack([
+                    tokens.ne(tokenizer.pad_token_id) for tokens in padded_input_ids
+                ]).to(device)
+
+                output = model.generate(
+                    input_ids=padded_input_ids,
+                    attention_mask=attn_mask,
+                    generation_config=generation_config,
+                )
+
+                for j, generated in enumerate(output):
+                    response = tokenizer.decode(
+                        generated[len(padded_input_ids[j]):], skip_special_tokens=True
+                    )
+
+                    prediction = extract_xml_answer(response)
+                    predictions.append(batches[j][1] == prediction)
+
+                status.set_description(f"Correct: {sum(predictions)}/{count}")
+
+        return np.mean(predictions)
+
+    return 0
+
 training_args = GRPOConfig(
     output_dir=output_dir,
     run_name=run_name,
@@ -297,6 +401,11 @@ training_args = GRPOConfig(
     vllm_gpu_memory_utilization=config["vllm"]["gpu_memory_utilization"],
     vllm_device=config["vllm"]["device"],
     gradient_checkpointing=config["training"]["gradient_checkpointing"],
+    # Add evaluation settings
+    do_eval=True,
+    eval_steps=config["training"].get("eval_steps", 50),  # Evaluate every 20 steps by default
+    per_device_eval_batch_size=config["training"].get("per_device_eval_batch_size", 32),  # Adjust based on GPU memory
+    eval_strategy="steps",
 )
 
 model = AutoModelForCausalLM.from_pretrained(
@@ -310,7 +419,7 @@ model = AutoModelForCausalLM.from_pretrained(
 tokenizer = AutoTokenizer.from_pretrained(model_name, cache_dir=cache_dir)
 tokenizer.pad_token = tokenizer.eos_token
 
-trainer = GRPOTrainer(
+trainer = CustomGRPOTrainer(
     model=model,
     processing_class=tokenizer,
     reward_funcs=[
@@ -325,5 +434,9 @@ trainer = GRPOTrainer(
     eval_dataset=test_dataset,  # Add test dataset for evaluation
 )
 
-# Run training with evaluation
+# After creating the trainer but before train()
+initial_metrics = trainer.evaluate()
+print("Initial evaluation metrics:", initial_metrics)
+
+# Then start training as normal
 trainer.train()

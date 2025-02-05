@@ -29,10 +29,10 @@ training:
   log_on_each_node: false
   gradient_checkpointing: true
   # Evaluation settings
-  evaluation_strategy: "steps"
-  eval_steps: 50
-  per_device_eval_batch_size: 1
   do_eval: true
+  eval_steps: 50
+  per_device_eval_batch_size: 128  # Adjust based on your GPU memory
+  eval_strategy: "steps"
 
 # VLLM configuration
 vllm:
