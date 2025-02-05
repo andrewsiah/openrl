@@ -1,5 +1,6 @@
 /src/outputs/*
 /src/training_logs/*
+/src/wandb/*
 
 
 # Byte-compiled / optimized / DLL files
