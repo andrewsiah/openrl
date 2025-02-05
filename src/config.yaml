@@ -1,0 +1,71 @@
+# Model configuration
+model:
+  # name: "Qwen/Qwen2.5-3B-Instruct"
+  # name: "meta-llama/Llama-3.2-3B-Instruct"
+  name: "Qwen/Qwen2.5-0.5B-Instruct"
+  cache_dir: "/shared/share_mala/andrew/models"
+  torch_dtype: "bfloat16"
+  attn_implementation: "flash_attention_2"
+
+# Training configuration
+training:
+  # output_dir: "outputs/Qwen-3B-GRPO"
+  # output_dir: "outputs/Llama-3.2-3B-GRPO"
+  # run_name: "Qwen-3B-GRPO-gsm8k"
+  # run_name: "Llama-3.2-3B-GRPO-gsm8k"
+  output_dir: "outputs/Qwen-0.5B-GRPO"
+  run_name: "Qwen-0.5B-GRPO-gsm8k"
+  learning_rate: 5.0e-6
+  adam_beta1: 0.9
+  adam_beta2: 0.99
+  weight_decay: 0.1
+  warmup_ratio: 0.1
+  lr_scheduler_type: "cosine"
+  logging_steps: 1
+  bf16: true
+  per_device_train_batch_size: 1
+  gradient_accumulation_steps: 4
+  num_generations: 16
+  max_prompt_length: 256
+  max_completion_length: 512
+  num_train_epochs: 1
+  save_steps: 1000
+  max_grad_norm: 0.1
+  report_to: "wandb"
+  log_on_each_node: false
+  gradient_checkpointing: true
+  # Evaluation settings
+  evaluation_strategy: "steps"
+  eval_steps: 
+  per_device_eval_batch_size: 1
+  do_eval: true
+
+# VLLM configuration
+vllm:
+  use_vllm: true
+  gpu_memory_utilization: 0.7
+  device: "cuda:7"
+
+# System prompts and formats
+prompts:
+  system_prompt: |
+    Respond in the following format:
+
+    <reasoning>
+    ...
+    </reasoning>
+    <answer>
+    ...
+    </answer>
+
+  xml_cot_format: |
+    <reasoning>
+    {reasoning}
+    </reasoning>
+    <answer>
+    {answer}
+    </answer>
+
+# Environment configuration
+environment:
+  pytorch_cuda_alloc_conf: "expandable_segments:True"
