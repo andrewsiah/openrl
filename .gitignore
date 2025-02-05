@@ -1,7 +1,7 @@
 /src/outputs/*
 /src/training_logs/*
 /src/wandb/*
-
+/src/sweep_configs/*
 
 # Byte-compiled / optimized / DLL files
 __pycache__/

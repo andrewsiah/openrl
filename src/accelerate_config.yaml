@@ -1,4 +1,4 @@
 compute_environment: LOCAL_MACHINE
 distributed_type: MULTI_GPU
-num_processes: 2
+num_processes: 7
 gpu_ids: all
