@@ -326,6 +326,4 @@ trainer = GRPOTrainer(
 )
 
 # Run training with evaluation
-trainer.evaluate()  # Run initial evaluation on test set
 trainer.train()
-trainer.evaluate()  # Run final evaluation on test set
