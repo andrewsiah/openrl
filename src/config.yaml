@@ -1,14 +1,14 @@
 # Model configuration
 model:
-  name: "Qwen/Qwen2.5-0.5B-Instruct"
+  name: "Qwen/Qwen2.5-1.5B"
   cache_dir: "/shared/share_mala/andrew/models"
   torch_dtype: "bfloat16"
   attn_implementation: "flash_attention_2"
 
 # Training configuration
 training:
-  output_dir: "outputs/Qwen-0.5B-GRPO"
-  run_name: "Qwen-0.5B-GRPO-gsm8k"
+  output_dir: "outputs/Qwen-1.5B-GRPO"
+  run_name: "Qwen-1.5B-GRPO-gsm8k"
   learning_rate: 5.0e-6
   adam_beta1: 0.9
   adam_beta2: 0.99
@@ -21,7 +21,7 @@ training:
   gradient_accumulation_steps: 4
   num_generations: 16
   max_prompt_length: 256
-  max_completion_length: 600
+  max_completion_length: 512
   num_train_epochs: 1
   save_steps: 1000
   max_grad_norm: 0.1
@@ -33,6 +33,25 @@ training:
   eval_steps: 50
   per_device_eval_batch_size: 128  # Adjust based on your GPU memory
   eval_strategy: "steps"
+  beta: 0.02
+
+# Reward function configuration
+rewards:
+  correctness:
+    correct: 2.0
+    incorrect: 0.0
+  integer_check:
+    is_digit: 0.5
+    not_digit: 0.0
+  strict_format:
+    valid: 0.5
+    invalid: 0.0
+  soft_format:
+    valid: 0.5
+    invalid: 0.0
+  xml_count:
+    per_tag: 0.125  # 4 tags * 0.125 = 0.5 max
+    trailing_penalty: 0.001  # per character after closing tags
 
 # VLLM configuration
 vllm:
@@ -41,16 +60,21 @@ vllm:
   device: "cuda:7"
 
 # System prompts and formats
+# ... existing code ...
 prompts:
   system_prompt: |
-    Respond in the following format:
+    A conversation between User and Assistant. The user asks a question, and the Assistant solves it. The assistant 
+    first thinks about the reasoning process in the mind and then provides the user with the answer. The reasoning 
+    process and answer are enclosed within <think> </think> and <answer> </answer> tags, respectively, i.e., 
+    <think> reasoning process here </think><answer> answer here </answer>
 
-    <reasoning>
-    ...
-    </reasoning>
-    <answer>
-    ...
-    </answer>
+
+  # <think>
+  # [reasoning process]
+  # </think>
+  # <answer>
+  # [final answer]
+  # </answer>
 
   xml_cot_format: |
     <reasoning>

@@ -30,70 +30,55 @@ with open(args.config, "r") as f:
 
 
 class LocalExampleLogger:
-    def __init__(self, log_dir: str = "training_logs"):
-        # Create logs directory with timestamp
-        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-        self.log_dir = os.path.join(log_dir, timestamp)
-        os.makedirs(self.log_dir, exist_ok=True)
-        self.jsonl_path = os.path.join(self.log_dir, "examples.jsonl")
-        self.eval_path = os.path.join(self.log_dir, "eval_results.jsonl")
+    def __init__(self):
+        """Initialize the logger with paths for training log and evaluation results."""
+        # Only create logs on the main process
+        self.is_main_process = not dist.is_initialized() or dist.get_rank() == 0
         
-        # Set up text logging
-        self.log_file = os.path.join(self.log_dir, "training.log")
-        logging.basicConfig(
-            level=logging.INFO,
-            format='%(asctime)s - %(levelname)s - %(message)s',
-            handlers=[
-                logging.FileHandler(self.log_file),
-                logging.StreamHandler()  # Also print to console
-            ]
-        )
-        self.logger = logging.getLogger(__name__)
+        # Initialize all attributes as None first
+        self.logger = None
+        self.log_dir = None
+        self.log_path = None
+        self.eval_path = None
+        self.examples_path = None
         
-        # Log initial setup
-        self.logger.info(f"Initialized training session at {timestamp}")
-        self.logger.info(f"Logs directory: {self.log_dir}")
+        if self.is_main_process:
+            # Create training logs directory with timestamp
+            timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+            self.log_dir = os.path.join("training_logs", timestamp)
+            os.makedirs(self.log_dir, exist_ok=True)
+
+            # Set up file paths
+            self.log_path = os.path.join(self.log_dir, "training.log")
+            self.eval_path = os.path.join(self.log_dir, "eval_results.jsonl")
+            self.examples_path = os.path.join(self.log_dir, "examples.jsonl")
+
+            # Set up logging
+            self.logger = logging.getLogger("training")
+            self.logger.setLevel(logging.INFO)
+            
+            # File handler
+            file_handler = logging.FileHandler(self.log_path)
+            file_handler.setLevel(logging.INFO)
+            
+            # Console handler
+            console_handler = logging.StreamHandler()
+            console_handler.setLevel(logging.INFO)
+            
+            # Formatter
+            formatter = logging.Formatter('%(asctime)s - %(message)s')
+            file_handler.setFormatter(formatter)
+            console_handler.setFormatter(formatter)
+            
+            # Add handlers
+            self.logger.addHandler(file_handler)
+            self.logger.addHandler(console_handler)
 
     def log_example(self, example_dict: Dict[str, Any]):
-        """Log a single example to JSONL format"""
-        log_dict = {
-            "step": example_dict["step"],
-            "question": example_dict["question"],
-            "true_answer": example_dict["true_answer"],
-            "response": example_dict["response"],
-            "extracted_response": example_dict["extracted_response"],
-            "correct": example_dict["correct"],
-            "generation_idx": example_dict["generation_idx"],
-            "timestamp": datetime.now().isoformat(),
-        }
-
-        # Append to JSONL
-        with open(self.jsonl_path, "a") as f:
-            f.write(json.dumps(log_dict) + "\n")
-            
-        # Log summary to text log
-        self.logger.info(
-            f"Step {example_dict['step']} - Generation {example_dict['generation_idx']} - "
-            f"Correct: {example_dict['correct']}"
-        )
-
-    def log_eval_results(self, results: Dict[str, Any], step: int):
-        """Log evaluation results to JSONL format and training log"""
-        log_dict = {
-            "step": step,
-            "timestamp": datetime.now().isoformat(),
-            **results
-        }
-
-        # Append to eval JSONL
-        with open(self.eval_path, "a") as f:
-            f.write(json.dumps(log_dict) + "\n")
-
-        # Log summary to text log
-        self.logger.info(f"=== Evaluation Results at Step {step} ===")
-        for key, value in results.items():
-            self.logger.info(f"{key}: {value}")
-        self.logger.info("=" * 50)
+        """Log a single example to the examples file."""
+        if self.is_main_process:
+            with open(self.examples_path, "a") as f:
+                f.write(json.dumps(example_dict) + "\n")
 
 
 # Set PyTorch memory allocation configuration
@@ -125,11 +110,11 @@ def extract_hash_answer(text: str) -> str | None:
 
 # uncomment middle messages for 1-shot prompting
 def get_gsm8k_questions(split="train") -> Dataset:
-    data = load_dataset("openai/gsm8k", "main")[split]  # type: ignore
+    data = load_dataset("openai/gsm8k", "main", split=split)  # type: ignore
     data = data.map(
         lambda x: {  # type: ignore
             "prompt": [
-                {"role": "system", "content": SYSTEM_PROMPT},
+                {"role": "user", "content": SYSTEM_PROMPT},
                 # {'role': 'user', 'content': 'What is the largest single-digit prime number?'},
                 # {'role': 'assistant', 'content': XML_COT_FORMAT.format(
                 #    reasoning="9 is divisble by 3 and 8 is divisible by 2, but 7 is prime.",
@@ -140,10 +125,14 @@ def get_gsm8k_questions(split="train") -> Dataset:
             "answer": extract_hash_answer(x["answer"]),
         }
     )  # type: ignore
+    
+    # Set the format for PyTorch
+    data = data.with_format("torch")
     return data  # type: ignore
 
 
-dataset = get_gsm8k_questions()
+# Load datasets
+dataset = get_gsm8k_questions("train")
 test_dataset = get_gsm8k_questions("test")
 
 # Initialize wandb before training
@@ -271,43 +260,50 @@ def correctness_reward_func(prompts, completions, answer, **kwargs) -> list[floa
         for key, value in metrics.items():
             trainer._metrics[key].append(value)
 
-    return [2.0 if r == a else 0.0 for r, a in zip(extracted_responses, answer)]
+    return [config["rewards"]["correctness"]["correct"] if r == a else config["rewards"]["correctness"]["incorrect"] 
+            for r, a in zip(extracted_responses, answer)]
 
 
 def int_reward_func(completions, **kwargs) -> list[float]:
     responses = [completion[0]["content"] for completion in completions]
     extracted_responses = [extract_xml_answer(r) for r in responses]
-    return [0.5 if r.isdigit() else 0.0 for r in extracted_responses]
+    return [config["rewards"]["integer_check"]["is_digit"] if r.isdigit() else config["rewards"]["integer_check"]["not_digit"] 
+            for r in extracted_responses]
 
 
 def strict_format_reward_func(completions, **kwargs) -> list[float]:
     """Reward function that checks if the completion has a specific format."""
-    pattern = r"^<reasoning>\n.*?\n</reasoning>\n<answer>\n.*?\n</answer>\n$"
+    pattern = r"^<think>.*?</think>\n<answer>.*?</answer>\n$"
     responses = [completion[0]["content"] for completion in completions]
     matches = [re.match(pattern, r) for r in responses]
-    return [0.5 if match else 0.0 for match in matches]
+    return [config["rewards"]["strict_format"]["valid"] if match else config["rewards"]["strict_format"]["invalid"] 
+            for match in matches]
 
 
 def soft_format_reward_func(completions, **kwargs) -> list[float]:
     """Reward function that checks if the completion has a specific format."""
-    pattern = r"<reasoning>.*?</reasoning>\s*<answer>.*?</answer>"
+    pattern = r"<think>.*?</think>\s*<answer>.*?</answer>"
     responses = [completion[0]["content"] for completion in completions]
     matches = [re.match(pattern, r) for r in responses]
-    return [0.5 if match else 0.0 for match in matches]
+    return [config["rewards"]["soft_format"]["valid"] if match else config["rewards"]["soft_format"]["invalid"] 
+            for match in matches]
 
 
 def count_xml(text) -> float:
     count = 0.0
-    if text.count("<reasoning>\n") == 1:
-        count += 0.125
-    if text.count("\n</reasoning>\n") == 1:
-        count += 0.125
+    per_tag_reward = config["rewards"]["xml_count"]["per_tag"]
+    trailing_penalty = config["rewards"]["xml_count"]["trailing_penalty"]
+    
+    if text.count("<think>\n") == 1:
+        count += per_tag_reward
+    if text.count("\n</think>\n") == 1:
+        count += per_tag_reward
     if text.count("\n<answer>\n") == 1:
-        count += 0.125
-        count -= len(text.split("\n</answer>\n")[-1]) * 0.001
+        count += per_tag_reward
+        count -= len(text.split("\n</answer>\n")[-1]) * trailing_penalty
     if text.count("\n</answer>") == 1:
-        count += 0.125
-        count -= (len(text.split("\n</answer>")[-1]) - 1) * 0.001
+        count += per_tag_reward
+        count -= (len(text.split("\n</answer>")[-1]) - 1) * trailing_penalty
     return count
 
 
@@ -324,11 +320,11 @@ class CustomGRPOTrainer(GRPOTrainer):
     def evaluate(
         self, eval_dataset=None, ignore_keys=None, metric_key_prefix: str = "eval"
     ):
-        # Get logger
+        # Get logger and example_logger for training logs
         logger = correctness_reward_func.example_logger.logger if hasattr(correctness_reward_func, "example_logger") else None
         example_logger = correctness_reward_func.example_logger if hasattr(correctness_reward_func, "example_logger") else None
         
-        if logger:
+        if logger is not None:
             logger.info("Starting evaluation...")
         
         # Set seed for evaluation
@@ -342,7 +338,7 @@ class CustomGRPOTrainer(GRPOTrainer):
             self.eval_dataset, 
             self.args.max_prompt_length
         )
-        eval_acc = generate_gsm8k(
+        eval_acc, prompts_and_responses = generate_gsm8k(
             self.model, 
             self.processing_class, 
             tokenized_samples, 
@@ -354,14 +350,22 @@ class CustomGRPOTrainer(GRPOTrainer):
             f"{metric_key_prefix}_accuracy": eval_acc,
             "epoch": self.state.epoch,
             "step": self.state.global_step,
+            "prompts_and_responses": prompts_and_responses,  # Include the prompts and responses
+            "timestamp": datetime.now().isoformat()
         }
         
-        if example_logger:
-            example_logger.log_eval_results(output, self.state.global_step)
+        # Write eval results directly to JSONL if on main process
+        if hasattr(correctness_reward_func, "example_logger") and correctness_reward_func.example_logger.is_main_process:
+            eval_path = correctness_reward_func.example_logger.eval_path
+            with open(eval_path, "a") as f:
+                f.write(json.dumps(output) + "\n")
 
-        self.log(output)
+        # Remove prompts_and_responses from metrics logged to wandb
+        wandb_output = {k: v for k, v in output.items() if k != "prompts_and_responses"}
+        self.log(wandb_output)
+        
         self.control = self.callback_handler.on_evaluate(
-            self.args, self.state, self.control, output
+            self.args, self.state, self.control, wandb_output
         )
 
         return output
@@ -387,64 +391,107 @@ def generate_gsm8k(
     batch_size,
     max_completion_length
 ):
-    # run eval on main process only
-    if not dist.is_initialized() or dist.get_rank() == 0:
-        # Set evaluation to deterministic mode
-        torch.backends.cudnn.deterministic = True
-        torch.backends.cudnn.benchmark = False
-        
-        device = model.device
-        predictions = []
-        generation_config = GenerationConfig(
-            max_new_tokens=max_completion_length,
-            do_sample=False,
-            num_beams=1,  # Ensure deterministic behavior with greedy decoding
-            repetition_penalty=1.0,
-            eos_token_id=tokenizer.eos_token_id,
-            pad_token_id=tokenizer.pad_token_id,
-            use_cache=True,  # Enable KV-cache for faster generation
-        )
-        model.eval()
-        count = len(tokenized_samples)
-        
-        # Process in fixed size batches to ensure consistency
-        status = tqdm.tqdm(range(0, count, batch_size), desc=f"Correct: 0/{count}")
-        for i in status:
-            # Ensure we don't exceed the dataset size
-            end_idx = min(i + batch_size, count)
-            batches = tokenized_samples[i:end_idx]
-            with torch.inference_mode():
-                longest = max(len(b[0]) for b in batches)
+    device = model.device
+    predictions = []
+    prompts_and_responses = []
+    
+    # Set evaluation to deterministic mode
+    torch.backends.cudnn.deterministic = True
+    torch.backends.cudnn.benchmark = False
+    
+    # Get world size and rank for distributed processing
+    world_size = dist.get_world_size() if dist.is_initialized() else 1
+    rank = dist.get_rank() if dist.is_initialized() else 0
+    
+    # Split samples across GPUs
+    samples_per_gpu = len(tokenized_samples) // world_size
+    start_idx = rank * samples_per_gpu
+    end_idx = start_idx + samples_per_gpu if rank != world_size - 1 else len(tokenized_samples)
+    local_samples = tokenized_samples[start_idx:end_idx]
+    
+    generation_config = GenerationConfig(
+        max_new_tokens=max_completion_length,
+        do_sample=False,
+        num_beams=1,  # Ensure deterministic behavior with greedy decoding
+        repetition_penalty=1.0,
+        eos_token_id=tokenizer.eos_token_id,
+        pad_token_id=tokenizer.pad_token_id,
+        use_cache=True,  # Enable KV-cache for faster generation
+    )
+    
+    model.eval()
+    count = len(local_samples)
+    
+    # Process in fixed size batches
+    status = tqdm.tqdm(range(0, count, batch_size), desc=f"Rank {rank} Evaluating", disable=rank != 0)
+    for i in status:
+        # Ensure we don't exceed the dataset size
+        end_idx = min(i + batch_size, count)
+        batches = local_samples[i:end_idx]
+        with torch.inference_mode():
+            longest = max(len(b[0]) for b in batches)
 
-                # pad to longest on left side for decoder
-                padded_input_ids = torch.stack([
-                    torch.tensor([tokenizer.pad_token_id] * (longest - len(ids)) + ids)
-                    for ids, _ in batches
-                ]).to(device)
-                # ignore pad token when generating
-                attn_mask = torch.stack([
-                    tokens.ne(tokenizer.pad_token_id) for tokens in padded_input_ids
-                ]).to(device)
+            # pad to longest on left side for decoder
+            padded_input_ids = torch.stack([
+                torch.tensor([tokenizer.pad_token_id] * (longest - len(ids)) + ids)
+                for ids, _ in batches
+            ]).to(device)
+            # ignore pad token when generating
+            attn_mask = torch.stack([
+                tokens.ne(tokenizer.pad_token_id) for tokens in padded_input_ids
+            ]).to(device)
 
-                output = model.generate(
-                    input_ids=padded_input_ids,
-                    attention_mask=attn_mask,
-                    generation_config=generation_config,
+            output = model.generate(
+                input_ids=padded_input_ids,
+                attention_mask=attn_mask,
+                generation_config=generation_config,
+            )
+
+            for j, generated in enumerate(output):
+                # Get the prompt
+                prompt = tokenizer.decode(padded_input_ids[j], skip_special_tokens=True)
+                # Get the response
+                response = tokenizer.decode(
+                    generated[len(padded_input_ids[j]):], skip_special_tokens=True
                 )
 
-                for j, generated in enumerate(output):
-                    response = tokenizer.decode(
-                        generated[len(padded_input_ids[j]):], skip_special_tokens=True
-                    )
+                prediction = extract_xml_answer(response)
+                predictions.append(batches[j][1] == prediction)
+                
+                # Store prompt and response
+                prompts_and_responses.append({
+                    "prompt": prompt,
+                    "response": response,
+                    "prediction": prediction,
+                    "true_answer": batches[j][1],
+                    "is_correct": batches[j][1] == prediction,
+                    "rank": rank  # Add rank information
+                })
 
-                    prediction = extract_xml_answer(response)
-                    predictions.append(batches[j][1] == prediction)
-
-                status.set_description(f"Correct: {sum(predictions)}/{count}")
-
-        return np.mean(predictions)
-
-    return 0
+                if rank == 0:  # Update progress only on main process
+                    status.set_description(f"Local Correct: {sum(predictions)}/{len(predictions)}")
+    
+    # Gather results from all processes
+    if dist.is_initialized():
+        # Gather predictions
+        gathered_predictions = [None] * world_size
+        dist.all_gather_object(gathered_predictions, predictions)
+        
+        # Gather prompts and responses
+        gathered_prompts_responses = [None] * world_size
+        dist.all_gather_object(gathered_prompts_responses, prompts_and_responses)
+        
+        # Combine results on all processes
+        all_predictions = []
+        all_prompts_responses = []
+        for pred_list in gathered_predictions:
+            all_predictions.extend(pred_list)
+        for pr_list in gathered_prompts_responses:
+            all_prompts_responses.extend(pr_list)
+            
+        return np.mean(all_predictions), all_prompts_responses
+    
+    return np.mean(predictions), prompts_and_responses
 
 training_args = GRPOConfig(
     output_dir=output_dir,
@@ -482,6 +529,7 @@ training_args = GRPOConfig(
     seed=42,  # Fixed seed for reproducibility
     data_seed=42,  # Fixed seed for data sampling
     full_determinism=not config["vllm"]["use_vllm"],  # Only enable full determinism when not using VLLM
+    beta=config["training"]["beta"] # KL coefficient
 )
 
 model = AutoModelForCausalLM.from_pretrained(
@@ -519,6 +567,7 @@ if hasattr(correctness_reward_func, "example_logger"):
     logger.info("Starting training...")
 
 # Then start training as normal
+trainer.evaluate()
 trainer.train()
 
 if hasattr(correctness_reward_func, "example_logger"):
