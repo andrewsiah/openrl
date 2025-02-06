@@ -26,7 +26,7 @@ def generate_sweep_configs() -> List[Dict[str, Any]]:
             ]
         },
         "training": {
-            "learning_rate": [1e-5, 5e-6],
+            "learning_rate": [5e-6],
             "per_device_train_batch_size": [1],
             "gradient_accumulation_steps": [4],
             "num_generations": [16],
