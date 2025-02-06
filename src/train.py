@@ -5,6 +5,7 @@ import json
 import argparse
 from datetime import datetime
 from typing import Dict, Any
+import logging
 
 import tqdm
 import numpy as np
@@ -35,6 +36,23 @@ class LocalExampleLogger:
         self.log_dir = os.path.join(log_dir, timestamp)
         os.makedirs(self.log_dir, exist_ok=True)
         self.jsonl_path = os.path.join(self.log_dir, "examples.jsonl")
+        self.eval_path = os.path.join(self.log_dir, "eval_results.jsonl")
+        
+        # Set up text logging
+        self.log_file = os.path.join(self.log_dir, "training.log")
+        logging.basicConfig(
+            level=logging.INFO,
+            format='%(asctime)s - %(levelname)s - %(message)s',
+            handlers=[
+                logging.FileHandler(self.log_file),
+                logging.StreamHandler()  # Also print to console
+            ]
+        )
+        self.logger = logging.getLogger(__name__)
+        
+        # Log initial setup
+        self.logger.info(f"Initialized training session at {timestamp}")
+        self.logger.info(f"Logs directory: {self.log_dir}")
 
     def log_example(self, example_dict: Dict[str, Any]):
         """Log a single example to JSONL format"""
@@ -46,11 +64,36 @@ class LocalExampleLogger:
             "extracted_response": example_dict["extracted_response"],
             "correct": example_dict["correct"],
             "generation_idx": example_dict["generation_idx"],
+            "timestamp": datetime.now().isoformat(),
         }
 
         # Append to JSONL
         with open(self.jsonl_path, "a") as f:
             f.write(json.dumps(log_dict) + "\n")
+            
+        # Log summary to text log
+        self.logger.info(
+            f"Step {example_dict['step']} - Generation {example_dict['generation_idx']} - "
+            f"Correct: {example_dict['correct']}"
+        )
+
+    def log_eval_results(self, results: Dict[str, Any], step: int):
+        """Log evaluation results to JSONL format and training log"""
+        log_dict = {
+            "step": step,
+            "timestamp": datetime.now().isoformat(),
+            **results
+        }
+
+        # Append to eval JSONL
+        with open(self.eval_path, "a") as f:
+            f.write(json.dumps(log_dict) + "\n")
+
+        # Log summary to text log
+        self.logger.info(f"=== Evaluation Results at Step {step} ===")
+        for key, value in results.items():
+            self.logger.info(f"{key}: {value}")
+        self.logger.info("=" * 50)
 
 
 # Set PyTorch memory allocation configuration
@@ -185,6 +228,9 @@ def correctness_reward_func(prompts, completions, answer, **kwargs) -> list[floa
             "correctness/correct_count": len(correct_indices),
             "correctness/total_examples": len(responses),
             "correctness/accuracy": len(correct_indices) / len(responses),
+            # Average lengths
+            "length/correct_avg": sum(len(responses[i].split()) for i in correct_indices) / len(correct_indices) if correct_indices else 0,
+            "length/incorrect_avg": sum(len(responses[i].split()) for i in incorrect_indices) / len(incorrect_indices) if incorrect_indices else 0,
             # Total markers across all responses
             "markers/total/uncertainty": sum(uncertainty_counts),
             "markers/total/internal_dialogue": sum(internal_dialogue_counts),
@@ -278,6 +324,19 @@ class CustomGRPOTrainer(GRPOTrainer):
     def evaluate(
         self, eval_dataset=None, ignore_keys=None, metric_key_prefix: str = "eval"
     ):
+        # Get logger
+        logger = correctness_reward_func.example_logger.logger if hasattr(correctness_reward_func, "example_logger") else None
+        example_logger = correctness_reward_func.example_logger if hasattr(correctness_reward_func, "example_logger") else None
+        
+        if logger:
+            logger.info("Starting evaluation...")
+        
+        # Set seed for evaluation
+        if hasattr(self.args, "seed") and self.args.seed is not None:
+            torch.manual_seed(self.args.seed)
+            if torch.cuda.is_available():
+                torch.cuda.manual_seed_all(self.args.seed)
+        
         tokenized_samples = tokenize_validation(
             self.processing_class, 
             self.eval_dataset, 
@@ -294,7 +353,11 @@ class CustomGRPOTrainer(GRPOTrainer):
         output = {
             f"{metric_key_prefix}_accuracy": eval_acc,
             "epoch": self.state.epoch,
+            "step": self.state.global_step,
         }
+        
+        if example_logger:
+            example_logger.log_eval_results(output, self.state.global_step)
 
         self.log(output)
         self.control = self.callback_handler.on_evaluate(
@@ -326,21 +389,30 @@ def generate_gsm8k(
 ):
     # run eval on main process only
     if not dist.is_initialized() or dist.get_rank() == 0:
+        # Set evaluation to deterministic mode
+        torch.backends.cudnn.deterministic = True
+        torch.backends.cudnn.benchmark = False
+        
         device = model.device
         predictions = []
         generation_config = GenerationConfig(
             max_new_tokens=max_completion_length,
             do_sample=False,
+            num_beams=1,  # Ensure deterministic behavior with greedy decoding
             repetition_penalty=1.0,
             eos_token_id=tokenizer.eos_token_id,
             pad_token_id=tokenizer.pad_token_id,
+            use_cache=True,  # Enable KV-cache for faster generation
         )
         model.eval()
         count = len(tokenized_samples)
         
+        # Process in fixed size batches to ensure consistency
         status = tqdm.tqdm(range(0, count, batch_size), desc=f"Correct: 0/{count}")
         for i in status:
-            batches = tokenized_samples[i:i+batch_size]
+            # Ensure we don't exceed the dataset size
+            end_idx = min(i + batch_size, count)
+            batches = tokenized_samples[i:end_idx]
             with torch.inference_mode():
                 longest = max(len(b[0]) for b in batches)
 
@@ -403,9 +475,13 @@ training_args = GRPOConfig(
     gradient_checkpointing=config["training"]["gradient_checkpointing"],
     # Add evaluation settings
     do_eval=True,
-    eval_steps=config["training"].get("eval_steps", 50),  # Evaluate every 20 steps by default
-    per_device_eval_batch_size=config["training"].get("per_device_eval_batch_size", 32),  # Adjust based on GPU memory
+    eval_steps=config["training"].get("eval_steps", 50),
+    per_device_eval_batch_size=config["training"].get("per_device_eval_batch_size", 32),
     eval_strategy="steps",
+    # Add deterministic settings - but only if not using VLLM
+    seed=42,  # Fixed seed for reproducibility
+    data_seed=42,  # Fixed seed for data sampling
+    full_determinism=not config["vllm"]["use_vllm"],  # Only enable full determinism when not using VLLM
 )
 
 model = AutoModelForCausalLM.from_pretrained(
@@ -438,5 +514,13 @@ trainer = CustomGRPOTrainer(
 initial_metrics = trainer.evaluate()
 print("Initial evaluation metrics:", initial_metrics)
 
+if hasattr(correctness_reward_func, "example_logger"):
+    logger = correctness_reward_func.example_logger.logger
+    logger.info("Starting training...")
+
 # Then start training as normal
 trainer.train()
+
+if hasattr(correctness_reward_func, "example_logger"):
+    logger = correctness_reward_func.example_logger.logger
+    logger.info("Training completed!")
